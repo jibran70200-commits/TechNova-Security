@@ -1,125 +1,204 @@
-import streamlit as st
+import socket
+import threading
 import time
 from collections import defaultdict, deque
-import random
 
-st.set_page_config(page_title="Security Simulation", page_icon="🔐")
+HOST = "127.0.0.1"
+PORT = 9999
 
-# ---------------------------------------------------------
-# SIMULATED SERVER STATE (No real networking)
-# ---------------------------------------------------------
 USERS = {"alice": "alicepass"}
 
+# DOS settings
 REQUEST_WINDOW = 5
 REQUEST_THRESHOLD = 20
 BLOCK_DURATION = 20
 
-request_log = defaultdict(lambda: deque())
+ip_timestamps = defaultdict(lambda: deque())
 blocked_until = {}
-active_connections = defaultdict(int)
+connection_counts = defaultdict(int)
 
-# ---------------------------------------------------------
-# UTILITY FUNCTIONS
-# ---------------------------------------------------------
+lock = threading.Lock()
+server_running = False
+
+# -----------------------------------------------------
+# SERVER CODE
+# -----------------------------------------------------
+
 def is_blocked(ip):
     until = blocked_until.get(ip)
     return until and time.time() < until
 
 def register_request(ip):
     now = time.time()
-    dq = request_log[ip]
+    dq = ip_timestamps[ip]
     dq.append(now)
+
     while dq and dq[0] < now - REQUEST_WINDOW:
         dq.popleft()
+
     return len(dq)
 
-# ---------------------------------------------------------
-# SIMULATED SERVER LOGIC
-# ---------------------------------------------------------
-def simulated_server_request(ip, command):
-    if is_blocked(ip):
-        return "❌ IP BLOCKED"
+def handle_client(conn, addr):
+    ip = addr[0]
 
-    req_count = register_request(ip)
+    with lock:
+        connection_counts[ip] += 1
 
-    if req_count > REQUEST_THRESHOLD:
-        blocked_until[ip] = time.time() + BLOCK_DURATION
-        return "🚨 DOS DETECTED → IP BLOCKED"
+    try:
+        data = conn.recv(1024).decode().strip()
+        if not data:
+            return
 
-    parts = command.split()
+        # Check if IP is blocked
+        if is_blocked(ip):
+            conn.sendall(b"ERROR: Your IP is BLOCKED\n")
+            return
 
-    if parts[0].upper() == "LOGIN":
-        if USERS.get(parts[1]) == parts[2]:
-            return "✅ Login successful"
+        # DOS check
+        count = register_request(ip)
+        if count > REQUEST_THRESHOLD:
+            with lock:
+                blocked_until[ip] = time.time() + BLOCK_DURATION
+            conn.sendall(b"ALERT: DOS detected → IP BLOCKED\n")
+            print(f"[BLOCKED] {ip} banned for {BLOCK_DURATION} sec")
+            return
+
+        parts = data.split()
+
+        # LOGIN user pass
+        if parts[0].upper() == "LOGIN" and len(parts) >= 3:
+            user = parts[1]
+            pwd = parts[2]
+            if USERS.get(user) == pwd:
+                conn.sendall(b"OK: Login successful\n")
+            else:
+                conn.sendall(b"ERROR: Wrong credentials\n")
+
+        elif parts[0].upper() == "PING":
+            conn.sendall(b"PONG\n")
+
         else:
-            return "❌ Incorrect credentials"
+            conn.sendall(b"OK: Command received\n")
 
-    if parts[0].upper() == "PING":
-        return "🏓 PONG"
+    except Exception as e:
+        print("Client error:", e)
 
-    return "✔ Command received"
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
 
-# ---------------------------------------------------------
-# USER SIMULATION
-# ---------------------------------------------------------
+        with lock:
+            connection_counts[ip] -= 1
+
+
+def start_server():
+    global server_running
+    server_running = True
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind((HOST, PORT))
+    s.listen(200)
+
+    print(f"\n[SERVER STARTED] Listening on {HOST}:{PORT}\n")
+
+    try:
+        while server_running:
+            conn, addr = s.accept()
+            threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+    except:
+        pass
+    finally:
+        s.close()
+        print("\n[SERVER STOPPED]\n")
+
+
+# -----------------------------------------------------
+# USER CLIENT
+# -----------------------------------------------------
+
 def legit_user():
-    ip = "USER_IP"
-    logs = []
+    print("\n[USER] Connecting...\n")
 
-    logs.append(simulated_server_request(ip, "LOGIN alice alicepass"))
+    def send(msg):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((HOST, PORT))
+        s.sendall(msg.encode() + b"\n")
+        data = s.recv(1024).decode()
+        s.close()
+        return data
+
+    print(send("LOGIN alice alicepass"))
+
     for i in range(5):
-        logs.append(f"PING {i+1} → " + simulated_server_request(ip, "PING"))
-        time.sleep(0.3)
+        print("PING →", send("PING"))
+        time.sleep(1)
 
-    return logs
 
-# ---------------------------------------------------------
-# ATTACKER SIMULATION
-# ---------------------------------------------------------
-def attacker_sim():
-    ip = "ATTACKER_IP"
-    logs = []
+# -----------------------------------------------------
+# ATTACKER CLIENT
+# -----------------------------------------------------
 
-    for _ in range(200):
-        resp = simulated_server_request(ip, "FAKECMD")
-        logs.append(resp)
+def attacker():
+    print("\n[ATTACKER STARTED] Flooding server...\n")
 
-    return logs
+    ip = "attacker"
 
-# ---------------------------------------------------------
-# STREAMLIT UI
-# ---------------------------------------------------------
-st.title("🔐 Security System Simulation (Streamlit Safe Version)")
-st.write("This version **does not use sockets**, so it runs correctly on Streamlit Cloud.")
+    for i in range(300):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((HOST, PORT))
+            s.sendall(b"FAKECMD attack\n")
+            try:
+                print(s.recv(1024).decode().strip())
+            except:
+                pass
+            s.close()
+        except:
+            print("Connection refused / blocked")
+        time.sleep(0.01)
 
-col1, col2 = st.columns(2)
+    print("\n[ATTACKER FINISHED]\n")
 
-with col1:
-    if st.button("👤 Run Legit User"):
-        output = legit_user()
-        st.code("\n".join(output))
 
-with col2:
-    if st.button("⚠ Run DOS Attacker"):
-        output = attacker_sim()
-        st.code("\n".join(output))
+# -----------------------------------------------------
+# MENU
+# -----------------------------------------------------
 
-# ---------------------------------------------------------
-# Display Server State
-# ---------------------------------------------------------
-st.subheader("📊 Server Monitoring")
+def menu():
+    print("""
+===============================
+   SECURITY SYSTEM SIMULATOR
+===============================
+1. Start Server
+2. Run Legit User
+3. Run Attacker (DOS)
+4. Exit
+""")
 
-# Active connection count (simulated)
-st.write("Active Connections:", random.randint(1, 5))
+    choice = input("Enter choice: ")
 
-# Blocked IPs
-blocked = {ip: int(blocked_until[ip] - time.time())
-           for ip in blocked_until if blocked_until[ip] > time.time()}
+    if choice == "1":
+        threading.Thread(target=start_server, daemon=True).start()
+        menu()
 
-st.write("Blocked IPs:", blocked if blocked else "None")
+    elif choice == "2":
+        legit_user()
+        menu()
 
-# Request logs
-st.subheader("📜 Recent Request Count")
+    elif choice == "3":
+        attacker()
+        menu()
 
-display_counts = {ip: len(request_log[ip]) for ip in request_log}
-st.json(display_counts)
+    elif choice == "4":
+        print("Exiting...")
+        exit()
+
+    else:
+        print("Invalid choice")
+        menu()
+
+
+if __name__ == "__main__":
+    menu()
