@@ -3,9 +3,6 @@ import socket
 import threading
 import time
 from collections import defaultdict, deque
-from pyvis.network import Network
-import tempfile
-import os
 
 # ---------------------------------------------------------
 #  CONFIG
@@ -13,19 +10,17 @@ import os
 HOST = "127.0.0.1"
 PORT = 9999
 
-USERS = {"alice": "alicepass"}  # simple user db
+USERS = {"alice": "alicepass"}
 
-REQUEST_WINDOW = 5          # seconds
-REQUEST_THRESHOLD = 20      # request limit
-BLOCK_DURATION = 20         # seconds
+REQUEST_WINDOW = 5
+REQUEST_THRESHOLD = 20
+BLOCK_DURATION = 20
 
 ip_timestamps = defaultdict(lambda: deque())
 blocked_until = {}
 connection_counts = defaultdict(int)
 
 lock = threading.Lock()
-
-# Server state
 server_running = False
 
 # ---------------------------------------------------------
@@ -49,11 +44,12 @@ def handle_client(conn, addr):
         connection_counts[ip] += 1
 
     try:
+        data = conn.recv(1024).decode().strip()
+
         if is_blocked(ip):
             conn.sendall(b"ERROR: IP BLOCKED.\n")
             return
 
-        data = conn.recv(1024).decode().strip()
         if not data:
             return
 
@@ -81,23 +77,13 @@ def handle_client(conn, addr):
     except:
         pass
     finally:
-        try:
-            conn.close()
-        except:
-            pass
-
         with lock:
             connection_counts[ip] -= 1
-
-def monitor_thread():
-    while server_running:
-        time.sleep(2)
+        conn.close()
 
 def start_server():
     global server_running
     server_running = True
-
-    threading.Thread(target=monitor_thread, daemon=True).start()
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind((HOST, PORT))
@@ -120,67 +106,45 @@ def stop_server():
 #  USER SIMULATION
 # ---------------------------------------------------------
 def legit_user():
+    logs = []
+
     def send(msg):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((HOST, PORT))
             s.sendall(msg.encode() + b"\n")
             return s.recv(1024).decode()
 
-    logs = []
     logs.append(send("LOGIN alice alicepass"))
+
     for i in range(5):
-        logs.append(f"PING {i+1} → " + send("PING"))
+        logs.append("PING → " + send("PING"))
         time.sleep(1)
+
     return logs
 
 # ---------------------------------------------------------
 #  ATTACKER SIMULATION
 # ---------------------------------------------------------
-def attacker(flood_count=200):
+def attacker(flood=200):
     logs = []
-    for i in range(flood_count):
+    for _ in range(flood):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.connect((HOST, PORT))
                 s.sendall(b"FAKECMD attack\n")
                 try:
-                    resp = s.recv(1024).decode()
-                    logs.append(resp)
+                    logs.append(s.recv(1024).decode())
                 except:
-                    pass
+                    logs.append("Blocked")
         except:
-            logs.append("Connection refused / blocked")
+            logs.append("Connection refused")
     return logs
-
-# ---------------------------------------------------------
-#  LIVE NETWORK GRAPH
-# ---------------------------------------------------------
-def generate_graph():
-    net = Network(height="500px", width="100%", bgcolor="#000000", font_color="white")
-
-    net.add_node("SERVER", color="red", size=30)
-
-    # clients as nodes
-    for ip in ip_timestamps.keys():
-        count = len(ip_timestamps[ip])
-        color = "orange"
-        size = 15 + min(count, 30)
-
-        if is_blocked(ip):
-            color = "red"
-
-        net.add_node(ip, color=color, size=size)
-        net.add_edge(ip, "SERVER")
-
-    temp_path = tempfile.gettempdir() + "/network_graph.html"
-    net.save_graph(temp_path)
-    return temp_path
 
 # ---------------------------------------------------------
 #  STREAMLIT UI
 # ---------------------------------------------------------
-st.title("🔐 Security System Simulation — Streamlit")
-st.write("Single-file simulation: Server + Legit User + Attacker + Live Graph")
+st.title("🔐 Security System Simulation")
+st.write("Simple server + DOS simulation (single-file build-friendly version).")
 
 col1, col2 = st.columns(2)
 
@@ -194,25 +158,22 @@ with col1:
         st.error("Server stopped.")
 
 with col2:
-    if st.button("👤 Run Legit User"):
+    if st.button("👤 Legit User"):
         out = legit_user()
         st.code("\n".join(out))
 
-    if st.button("⚠ Run Attacker (Flood)"):
-        out = attacker(200)
+    if st.button("⚠ Run Attacker Flood"):
+        out = attacker()
         st.code("\n".join(out))
-
-st.subheader("📡 Live Network Graph")
-if st.button("Generate Graph"):
-    path = generate_graph()
-    st.success("Graph generated below 👇")
-    html = open(path, "r", encoding="utf-8").read()
-    st.components.v1.html(html, height=500, scrolling=True)
 
 st.subheader("📊 Server Status")
 
 with lock:
     st.write("Active Connections:", sum(connection_counts.values()))
-    st.write("Blocked IPs:", 
-             {ip: int(blocked_until[ip]-time.time()) 
-              for ip in blocked_until if blocked_until[ip] > time.time()})
+
+    blocked = {
+        ip: int(blocked_until[ip] - time.time())
+        for ip in blocked_until if blocked_until[ip] > time.time()
+    }
+
+    st.write("Blocked IPs:", blocked if blocked else "None")
