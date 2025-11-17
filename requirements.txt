@@ -1,0 +1,131 @@
+# server.py
+# Simple threaded TCP server with basic auth, DOS detection (rate-limit) and blocking.
+import socket
+import threading
+import time
+from collections import defaultdict, deque
+
+HOST = '127.0.0.1'
+PORT = 9999
+
+# Simple user database (username: password)
+USERS = {'alice': 'alicepass', 'bob': 'bobpass'}
+
+# DOS detection settings
+REQUEST_WINDOW = 5.0        # seconds window to count requests
+REQUEST_THRESHOLD = 20      # requests allowed in window before flagging
+BLOCK_DURATION = 30.0       # seconds to block an offending IP
+
+# Per-IP data
+ip_timestamps = defaultdict(lambda: deque())   # ip -> deque of request timestamps
+blocked_until = {}                              # ip -> unblock_epoch
+connection_counts = defaultdict(int)            # for stats
+
+lock = threading.Lock()
+
+def is_blocked(ip):
+    un_until = blocked_until.get(ip)
+    if un_until and time.time() < un_until:
+        return True
+    return False
+
+def register_request(ip):
+    now = time.time()
+    dq = ip_timestamps[ip]
+    dq.append(now)
+    # drop old timestamps
+    while dq and dq[0] < now - REQUEST_WINDOW:
+        dq.popleft()
+    return len(dq)
+
+def handle_client(conn, addr):
+    ip = addr[0]
+    with lock:
+        connection_counts[ip] += 1
+    try:
+        if is_blocked(ip):
+            conn.sendall(b'ERROR: Your IP is temporarily blocked due to suspicious activity.\n')
+            return
+
+        # Read a line
+        conn.settimeout(10.0)
+        data = conn.recv(1024).decode(errors='ignore').strip()
+        if not data:
+            return
+
+        # Count and detect DOS like behaviour
+        count = register_request(ip)
+        if count > REQUEST_THRESHOLD:
+            with lock:
+                blocked_until[ip] = time.time() + BLOCK_DURATION
+            msg = f'ALERT: Too many requests ({count}) — IP blocked for {BLOCK_DURATION} seconds.\n'
+            conn.sendall(msg.encode())
+            print(f'[SEC] {ip} blocked for {BLOCK_DURATION} seconds (count={count}).')
+            return
+
+        # Expect a simple protocol:
+        # LOGIN username password
+        # PING or ACTION ...
+        parts = data.split()
+        if parts[0].upper() == 'LOGIN' and len(parts) >= 3:
+            username = parts[1]
+            password = parts[2]
+            if USERS.get(username) == password:
+                conn.sendall(b'OK: Login successful.\n')
+            else:
+                conn.sendall(b'ERROR: Bad username/password.\n')
+        elif parts[0].upper() == 'PING':
+            conn.sendall(b'PONG\n')
+        else:
+            conn.sendall(b'OK: Command received.\n')
+
+    except socket.timeout:
+        pass
+    except Exception as e:
+        print('Exception in client handler:', e)
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
+        with lock:
+            connection_counts[ip] -= 1
+
+def monitor_thread():
+    # prints simple stats every few seconds
+    while True:
+        time.sleep(3)
+        with lock:
+            active_ips = len([ip for ip, c in connection_counts.items() if c>0])
+            blocked = {ip: int(blocked_until[ip]-time.time()) for ip in blocked_until if blocked_until[ip] > time.time()}
+            total_active_connections = sum(connection_counts.values())
+        print('--- Server stats ---')
+        print(f'Active IPs with open connections: {active_ips}')
+        print(f'Open connections total: {total_active_connections}')
+        print(f'Currently blocked IPs: {blocked if blocked else "None"}')
+        # optionally list top request counts
+        top = sorted(((ip, len(ip_timestamps[ip])) for ip in ip_timestamps), key=lambda x: -x[1])[:5]
+        print('Recent request counts (top 5):', top)
+        print('---------------------')
+
+def main():
+    monitor = threading.Thread(target=monitor_thread, daemon=True)
+    monitor.start()
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind((HOST, PORT))
+    s.listen(200)
+    print(f'Server listening on {HOST}:{PORT}')
+
+    try:
+        while True:
+            conn, addr = s.accept()
+            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+            t.start()
+    except KeyboardInterrupt:
+        print('Shutting down server.')
+    finally:
+        s.close()
+
+if __name__ == '__main__':
+    main()
